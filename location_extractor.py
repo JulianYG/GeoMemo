@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
+from datetime import datetime
 import osxphotos
 
 
@@ -57,10 +58,49 @@ class LocationExtractor:
         # If no exif_info attribute or it's None, likely a screenshot
         return False
     
-    def extract_locations(self) -> List[Dict]:
+    def deduplicate_locations(self, locations: List[Dict], precision: int = 6) -> List[Dict]:
+        """
+        Remove duplicate locations based on rounded coordinates.
+        
+        Args:
+            locations: List of location dictionaries
+            precision: Number of decimal places to round coordinates to (default: 6, ~0.1m precision)
+            
+        Returns:
+            Deduplicated list of location dictionaries
+        """
+        seen = set()
+        deduplicated = []
+        
+        for loc in locations:
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            
+            if lat is None or lon is None:
+                continue
+            
+            # Round coordinates to specified precision
+            rounded_lat = round(lat, precision)
+            rounded_lon = round(lon, precision)
+            
+            # Create a key for this location
+            location_key = (rounded_lat, rounded_lon)
+            
+            # Only add if we haven't seen this location before
+            if location_key not in seen:
+                seen.add(location_key)
+                deduplicated.append(loc)
+        
+        return deduplicated
+    
+    def extract_locations(self, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict]:
         """
         Extract location data from all photos with GPS coordinates.
         Filters out screenshots and non-camera media.
+        
+        Args:
+            start_date: Start date in YYYY-MM-DD format (inclusive). If None, no start filter.
+            end_date: End date in YYYY-MM-DD format (inclusive). If None, no end filter.
         
         Returns:
             List of dictionaries containing photo location data
@@ -68,8 +108,47 @@ class LocationExtractor:
         photos_with_location = []
         skipped_count = 0
         null_coord_count = 0
+        date_filtered_count = 0
+        
+        # Helper function to normalize datetimes to timezone-naive for comparison
+        def normalize_datetime(dt):
+            """Convert timezone-aware datetime to naive datetime."""
+            if dt is None:
+                return None
+            if dt.tzinfo is not None:
+                # Remove timezone info for comparison
+                return dt.replace(tzinfo=None)
+            return dt
+        
+        # Parse date strings if provided
+        start_datetime = None
+        end_datetime = None
+        
+        if start_date:
+            try:
+                start_datetime = datetime.strptime(start_date, '%Y-%m-%d')
+            except ValueError:
+                raise ValueError(f"Invalid start_date format: {start_date}. Expected YYYY-MM-DD")
+        
+        if end_date:
+            try:
+                # Set end_date to end of day for inclusive comparison
+                end_datetime = datetime.strptime(end_date, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
+            except ValueError:
+                raise ValueError(f"Invalid end_date format: {end_date}. Expected YYYY-MM-DD")
+        
+        if start_datetime and end_datetime and start_datetime > end_datetime:
+            raise ValueError("start_date must be before or equal to end_date")
+        
+        # Normalize parsed datetimes (they're already naive, but ensure consistency)
+        start_datetime = normalize_datetime(start_datetime)
+        end_datetime = normalize_datetime(end_datetime)
         
         print("Scanning Photos library...")
+        if start_date or end_date:
+            date_range_str = f" (date range: {start_date or 'any'} to {end_date or 'any'})"
+            print(f"Filtering by date range{date_range_str}...")
+        
         all_photos = self.photosdb.photos()
         total_photos = len(all_photos)
         
@@ -88,6 +167,20 @@ class LocationExtractor:
                 
                 # Skip if coordinates are invalid (0, 0 is often a default/error value)
                 if lat != 0.0 or lon != 0.0:
+                    # Filter by date range if specified
+                    if photo.date:
+                        photo_datetime = normalize_datetime(photo.date)
+                        if start_datetime and photo_datetime < start_datetime:
+                            date_filtered_count += 1
+                            continue
+                        if end_datetime and photo_datetime > end_datetime:
+                            date_filtered_count += 1
+                            continue
+                    elif (start_datetime or end_datetime):
+                        # If date filtering is requested but photo has no date, skip it
+                        date_filtered_count += 1
+                        continue
+                    
                     # Filter out screenshots and non-camera media
                     if not self._is_valid_camera_media(photo):
                         skipped_count += 1
@@ -135,6 +228,8 @@ class LocationExtractor:
             print(f"Skipped {skipped_count} screenshots/non-camera media")
         if null_coord_count > 0:
             print(f"Skipped {null_coord_count} photos/videos with null coordinates")
+        if date_filtered_count > 0:
+            print(f"Skipped {date_filtered_count} photos/videos outside date range")
         return photos_with_location
     
     def export_to_csv(self, locations: List[Dict], output_path: str = 'photo_locations.csv'):
@@ -296,19 +391,37 @@ def main():
     parser.add_argument(
         '--csv',
         type=str,
-        default='photo_locations.csv',
-        help='Output CSV file path (default: photo_locations.csv)'
+        default='',
+        help='Output CSV file path. If not provided, CSV will not be exported.'
     )
     parser.add_argument(
         '--geojson',
         type=str,
-        default='photo_locations.geojson',
-        help='Output GeoJSON file path (default: photo_locations.geojson)'
+        default='',
+        help='Output GeoJSON file path. If not provided, GeoJSON will not be exported.'
     )
     parser.add_argument(
-        '--stats-only',
+        '--start-from',
+        type=str,
+        default='',
+        help='Start date in YYYY-MM-DD format (inclusive). If empty, no start filter.'
+    )
+    parser.add_argument(
+        '--end-on',
+        type=str,
+        default='',
+        help='End date in YYYY-MM-DD format (inclusive). If empty, no end filter.'
+    )
+    parser.add_argument(
+        '--dedupe',
         action='store_true',
-        help='Only show statistics, do not export files'
+        help='Remove duplicate locations (same coordinates rounded to 6 decimal places, ~0.1m precision)'
+    )
+    parser.add_argument(
+        '--dedupe-precision',
+        type=int,
+        default=6,
+        help='Precision for deduplication (decimal places). Default: 6 (~0.1m). Lower = more aggressive deduplication.'
     )
     
     args = parser.parse_args()
@@ -316,8 +429,21 @@ def main():
     # Initialize extractor
     extractor = LocationExtractor(photos_db_path=args.photos_db)
     
+    # Parse date arguments (empty string means None)
+    start_date = args.start_from if args.start_from else None
+    end_date = args.end_on if args.end_on else None
+    
     # Extract locations
-    locations = extractor.extract_locations()
+    locations = extractor.extract_locations(start_date=start_date, end_date=end_date)
+    
+    # Deduplicate if requested
+    original_count = len(locations)
+    dedupe_count = 0
+    if args.dedupe:
+        locations = extractor.deduplicate_locations(locations, precision=args.dedupe_precision)
+        dedupe_count = original_count - len(locations)
+        if dedupe_count > 0:
+            print(f"\nDeduplicated: removed {dedupe_count} duplicate locations ({len(locations)} unique locations remaining)")
     
     # Show statistics
     stats = extractor.get_statistics(locations)
@@ -331,17 +457,27 @@ def main():
     print(f"  - With description: {stats['with_description']}")
     if stats.get('null_coordinates', 0) > 0:
         print(f"  - Null coordinates filtered: {stats['null_coordinates']}")
+    if dedupe_count > 0:
+        print(f"  - Duplicates removed: {dedupe_count}")
     if 'date_range' in stats:
         print(f"\nDate range:")
         print(f"  - Earliest: {stats['date_range']['earliest']}")
         print(f"  - Latest: {stats['date_range']['latest']}")
     print("="*50 + "\n")
     
-    # Export files unless stats-only
-    if not args.stats_only:
+    # Export files only if output paths are provided
+    exported_any = False
+    if args.csv:
         extractor.export_to_csv(locations, args.csv)
+        exported_any = True
+    if args.geojson:
         extractor.export_to_geojson(locations, args.geojson)
+        exported_any = True
+    
+    if exported_any:
         print("\n✓ Export complete!")
+    else:
+        print("\nNo output files specified. Use --csv and/or --geojson to export files.")
 
 
 if __name__ == '__main__':
