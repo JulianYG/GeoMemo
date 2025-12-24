@@ -36,14 +36,13 @@ pip install -r requirements.txt
 
 Run the extraction script:
 ```bash
-python extract_locations.py
+python location_extractor.py
 ```
 
 This will:
 - Scan your Apple Photos library
 - Extract all photos/videos with GPS coordinates
 - Display statistics
-- Create `photo_locations.csv` and `photo_locations.geojson`
 
 ### Using the Module Directly
 
