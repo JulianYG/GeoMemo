@@ -89,8 +89,11 @@ python location_extractor.py --dedupe --dedupe-distance 50 --csv locations.csv
 # Requires MAP_API_KEY in .env file
 python location_extractor.py --filter-panos --csv locations.csv
 
-# Custom panorama distance threshold (default: 40m)
-python location_extractor.py --filter-panos --pano-max-distance 30 --csv locations.csv
+# Custom panorama distance threshold (default: 200m)
+python location_extractor.py --filter-panos --pano-max-distance 150 --csv locations.csv
+
+# Test with limited API calls (check only first 10 locations)
+python location_extractor.py --filter-panos --api-limit 10 --csv locations.csv
 
 # Use a specific Photos library database
 python location_extractor.py --photos-db /path/to/Photos.sqlite --csv locations.csv
@@ -116,7 +119,8 @@ python location_extractor.py \
 | `--dedupe` | Remove duplicate locations within 200 meters (default distance) |
 | `--dedupe-distance N` | Custom deduplication distance in meters (default: 200m when --dedupe is used) |
 | `--filter-panos` | Filter locations to only include those with Street View panoramas (requires MAP_API_KEY) |
-| `--pano-max-distance N` | Maximum distance in meters between photo and panorama (default: 40m) |
+| `--pano-max-distance N` | Maximum distance in meters between photo and panorama (default: 200m) |
+| `--api-limit N` | Limit number of locations to check for Street View panoramas (for testing). Only applies when `--filter-panos` is used |
 | `--photos-db PATH` | Path to Photos library database (uses default if not specified) |
 
 ### Using the Module Directly
@@ -239,6 +243,14 @@ Useful for:
 **Database Access Issues**: If you have multiple Photos libraries, you may need to specify the database path using `--photos-db`.
 
 **MAP_API_KEY Not Found**: If using `--filter-panos`, make sure you have a `.env` file in the project root with `MAP_API_KEY=your_key_here`, or set it as an environment variable.
+
+**API Authorization Error ("This API project is not authorized to use this API")**: 
+- Go to [Google Cloud Console API Library](https://console.cloud.google.com/apis/library)
+- Search for "Street View Static API"
+- Click "Enable"
+- Wait a few minutes for changes to propagate
+- Make sure billing is enabled (free tier available with $200/month credit)
+- Verify your API key has the correct restrictions (or no restrictions for testing)
 
 **Failed to Load Location in GeoGuessr**: 
 - Use `--filter-panos` to validate Street View coverage before export

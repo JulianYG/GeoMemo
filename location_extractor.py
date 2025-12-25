@@ -149,7 +149,7 @@ class LocationExtractor:
         
         return deduplicated
     
-    def _check_street_view_pano(self, lat: float, lon: float, api_key: str, radius: int = 50) -> Optional[Dict]:
+    def _check_street_view_pano(self, lat: float, lon: float, api_key: str, radius: int = 1000, debug: bool = False) -> Optional[Dict]:
         """
         Check if a Street View panorama exists near the given coordinates.
         Uses Google Street View Metadata API.
@@ -158,7 +158,8 @@ class LocationExtractor:
             lat: Latitude
             lon: Longitude
             api_key: Google Maps API key
-            radius: Search radius in meters (default: 50m)
+            radius: Search radius in meters (default: 1000m)
+            debug: If True, print detailed debugging information
             
         Returns:
             Dictionary with pano info if found, None otherwise.
@@ -174,11 +175,26 @@ class LocationExtractor:
         
         try:
             url = f"{base_url}?{urllib.parse.urlencode(params)}"
+            # Mask API key in debug output
+            debug_url = url.replace(api_key, f"{api_key[:10]}...{api_key[-4:]}" if len(api_key) > 14 else "***")
+            
+            if debug:
+                print(f"\n🔍 Checking panorama for location ({lat}, {lon})")
+                print(f"   Request URL: {debug_url}")
+                print(f"   Radius: {radius}m")
+            
             request = urllib.request.Request(url)
             
-            with urllib.request.urlopen(request, timeout=5) as response:
-                data = json.loads(response.read().decode())
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response_text = response.read().decode()
+                data = json.loads(response_text)
                 status = data.get('status', 'UNKNOWN_ERROR')
+                
+                if debug:
+                    print(f"   Response status: {status}")
+                    if 'error_message' in data:
+                        print(f"   Error message: {data['error_message']}")
+                    print(f"   Full response: {json.dumps(data, indent=2)}")
                 
                 if status == 'OK':
                     pano_location = data.get('location', {})
@@ -190,29 +206,120 @@ class LocationExtractor:
                         # Calculate distance between photo location and panorama location
                         distance_m = self._haversine_distance(lat, lon, pano_lat, pano_lon)
                         
+                        if debug:
+                            print(f"   ✅ Found panorama at ({pano_lat}, {pano_lon})")
+                            print(f"   Distance: {distance_m:.2f}m")
+                            print(f"   Pano ID: {pano_id}")
+                        
                         return {
                             'pano_lat': pano_lat,
                             'pano_lon': pano_lon,
                             'pano_id': pano_id,
                             'distance_m': distance_m
                         }
+                    else:
+                        if debug:
+                            print(f"   ⚠️  Status OK but missing location data")
+                else:
+                    # Status is not OK - print why
+                    error_msg = data.get('error_message', '')
+                    if debug:
+                        if status == 'ZERO_RESULTS':
+                            print(f"   ❌ No panorama found within {radius}m radius")
+                        elif status == 'REQUEST_DENIED':
+                            print(f"   ❌ Request denied - API not authorized")
+                            if error_msg:
+                                print(f"   Error: {error_msg}")
+                            print(f"   📝 SOLUTION: Enable 'Street View Static API' in Google Cloud Console")
+                            print(f"      1. Go to https://console.cloud.google.com/apis/library")
+                            print(f"      2. Search for 'Street View Static API'")
+                            print(f"      3. Click 'Enable'")
+                            print(f"      4. Make sure billing is enabled (free tier available)")
+                        elif status == 'INVALID_REQUEST':
+                            print(f"   ❌ Invalid request - check parameters")
+                            if error_msg:
+                                print(f"   Error: {error_msg}")
+                        else:
+                            print(f"   ❌ Unexpected status: {status}")
+                            if error_msg:
+                                print(f"   Error: {error_msg}")
+                    
+                    # Always print authorization errors even without debug mode
+                    if status == 'REQUEST_DENIED' and 'not authorized' in error_msg.lower():
+                        if not hasattr(self, '_auth_error_shown'):
+                            self._auth_error_shown = True
+                            print(f"\n⚠️  API Authorization Error: {error_msg}")
+                            print(f"📝 SOLUTION: Enable 'Street View Static API' in Google Cloud Console")
+                            print(f"   1. Go to https://console.cloud.google.com/apis/library")
+                            print(f"   2. Search for 'Street View Static API'")
+                            print(f"   3. Click 'Enable'")
+                            print(f"   4. Wait a few minutes for changes to propagate")
+                            print(f"   5. Make sure billing is enabled (free tier available)\n")
                 
-                # No panorama found
+                # No panorama found (status is ZERO_RESULTS or other error)
                 return None
                 
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError) as e:
-            # If API call fails, return None (fail closed - don't include location)
+        except urllib.error.HTTPError as e:
+            # Handle HTTP errors (like API key issues, rate limits, etc.)
+            try:
+                error_body = e.read().decode()
+                error_data = json.loads(error_body) if error_body else {}
+                error_message = error_data.get('error_message', error_body[:200])
+            except:
+                error_message = str(e)
+            
+            # Only print first few errors to avoid spam
+            if not hasattr(self, '_error_count'):
+                self._error_count = 0
+            self._error_count += 1
+            
+            if self._error_count <= 3:
+                print(f"\n⚠️  API Error (HTTP {e.code}): {error_message[:150]}")
+                if e.code == 403:
+                    print("   This might be an API key permission issue. Check that Street View Static API is enabled.")
+                elif e.code == 400:
+                    print("   This might be an invalid API key or request format.")
+            
+            return None
+        except (urllib.error.URLError, TimeoutError) as e:
+            # Network errors - only print first few
+            if not hasattr(self, '_network_error_count'):
+                self._network_error_count = 0
+            self._network_error_count += 1
+            
+            if self._network_error_count <= 3:
+                print(f"\n⚠️  Network error: {str(e)[:150]}")
+            return None
+        except (json.JSONDecodeError, KeyError) as e:
+            # Invalid response format - only print first few
+            if not hasattr(self, '_parse_error_count'):
+                self._parse_error_count = 0
+            self._parse_error_count += 1
+            
+            if self._parse_error_count <= 3:
+                print(f"\n⚠️  Invalid API response format: {str(e)[:150]}")
+            return None
+        except Exception as e:
+            # Catch-all for any other errors - only print first few
+            if not hasattr(self, '_unexpected_error_count'):
+                self._unexpected_error_count = 0
+            self._unexpected_error_count += 1
+            
+            if self._unexpected_error_count <= 3:
+                print(f"\n⚠️  Unexpected error: {str(e)[:150]}")
             return None
     
-    def filter_street_view_panos(self, locations: List[Dict], api_key: str, max_distance_m: float = 40.0) -> Tuple[List[Dict], int]:
+    def filter_street_view_panos(self, locations: List[Dict], api_key: str, max_distance_m: float = 200.0, limit: Optional[int] = None, debug: bool = False) -> Tuple[List[Dict], int]:
         """
         Filter locations to only include those with Street View panoramas within acceptable distance.
         
         Args:
             locations: List of location dictionaries
             api_key: Google Maps API key
-            max_distance_m: Maximum distance in meters between photo and panorama (default: 40m)
+            max_distance_m: Maximum distance in meters between photo and panorama (default: 200m)
                           Locations with distance > max_distance_m will be filtered out
+            limit: Optional limit on number of locations to check (for testing)
+            debug: If True, print detailed debugging information for each API call
             
         Returns:
             Tuple of (filtered_locations, filtered_count)
@@ -220,12 +327,27 @@ class LocationExtractor:
         """
         filtered = []
         filtered_count = 0
+        no_pano_count = 0
+        too_far_count = 0
+        
+        # Reset error counters
+        self._error_count = 0
+        self._network_error_count = 0
+        self._parse_error_count = 0
+        self._unexpected_error_count = 0
+        
+        # Apply limit if specified
+        locations_to_check = locations[:limit] if limit else locations
+        skipped_by_limit = len(locations) - len(locations_to_check)
         
         print(f"Checking Street View panorama coverage (max distance: {max_distance_m}m)...")
-        total = len(locations)
+        if limit:
+            print(f"Limited to first {limit} locations for testing (skipping {skipped_by_limit} locations)")
+        
+        total = len(locations_to_check)
         
         # Use tqdm for progress bar
-        for loc in tqdm(locations, total=total, desc="Checking panoramas", unit="location"):
+        for loc in tqdm(locations_to_check, total=total, desc="Checking panoramas", unit="location"):
             lat = loc.get('latitude')
             lon = loc.get('longitude')
             
@@ -233,11 +355,12 @@ class LocationExtractor:
                 filtered_count += 1
                 continue
             
-            # Check for Street View panorama
-            pano_info = self._check_street_view_pano(lat, lon, api_key, radius=50)
+            # Check for Street View panorama (use larger radius for real-world GPS accuracy)
+            pano_info = self._check_street_view_pano(lat, lon, api_key, radius=1000, debug=debug)
             
             if pano_info is None:
                 # No panorama found
+                no_pano_count += 1
                 filtered_count += 1
                 continue
             
@@ -245,6 +368,7 @@ class LocationExtractor:
             
             if distance_m > max_distance_m:
                 # Panorama too far away
+                too_far_count += 1
                 filtered_count += 1
                 continue
             
@@ -256,6 +380,14 @@ class LocationExtractor:
             loc_with_pano['pano_id'] = pano_info.get('pano_id', '')
             
             filtered.append(loc_with_pano)
+        
+        # Print summary of why locations were filtered
+        if filtered_count > 0:
+            print(f"\nFiltering summary:")
+            print(f"  - No panorama found: {no_pano_count}")
+            print(f"  - Panorama too far (> {max_distance_m}m): {too_far_count}")
+            if self._error_count > 0:
+                print(f"  - API errors encountered: {self._error_count}")
         
         return filtered, filtered_count
     
@@ -646,8 +778,19 @@ def main():
     parser.add_argument(
         '--pano-max-distance',
         type=float,
-        default=40.0,
-        help='Maximum distance in meters between photo location and Street View panorama (default: 40m). Locations with distance > this will be filtered out.'
+        default=200.0,
+        help='Maximum distance in meters between photo location and Street View panorama (default: 200m). Locations with distance > this will be filtered out.'
+    )
+    parser.add_argument(
+        '--api-limit',
+        type=int,
+        default=None,
+        help='Limit number of locations to check for Street View panoramas (for testing). Only applies when --filter-panos is used.'
+    )
+    parser.add_argument(
+        '--debug-panos',
+        action='store_true',
+        help='Print detailed debugging information for Street View panorama API calls'
     )
     
     args = parser.parse_args()
@@ -681,14 +824,18 @@ def main():
         if not api_key:
             print("\n⚠️  Warning: --filter-panos requires MAP_API_KEY in .env file or environment variable. Skipping panorama filtering.")
         else:
+            print(f"\nUsing API key: {api_key[:10]}...{api_key[-4:] if len(api_key) > 14 else '***'}")
+            locations_before = len(locations)
             locations, pano_filtered_count = extractor.filter_street_view_panos(
                 locations,
                 api_key=api_key,
-                max_distance_m=args.pano_max_distance
+                max_distance_m=args.pano_max_distance,
+                limit=args.api_limit,
+                debug=args.debug_panos
             )
             if pano_filtered_count > 0:
                 print(f"\nFiltered out {pano_filtered_count} locations without Street View panoramas or with panoramas too far away")
-                print(f"({len(locations)} locations with valid panoramas remaining)")
+                print(f"({len(locations)} locations with valid panoramas remaining out of {args.api_limit or locations_before} checked)")
             else:
                 print(f"\nAll {len(locations)} locations have valid Street View panoramas")
     
