@@ -3,6 +3,20 @@ Location Extractor Module
 
 Extracts location data from Apple Photos library using osxphotos.
 Exports location data to CSV and GeoJSON formats for GeoGuessr map creation.
+
+Note on GeoGuessr Coverage:
+GeoGuessr handles locations without Street View coverage by finding the nearest
+available Street View location or using satellite/aerial imagery as a fallback.
+However, some locations may still fail to load if:
+- The location is in a remote area with no nearby Street View coverage
+- The coordinates are in oceans or areas completely without imagery
+- There are temporary API issues
+
+The extractor validates coordinates to ensure they're within valid ranges (-90 to 90
+for latitude, -180 to 180 for longitude) and filters out obviously invalid coordinates
+like (0, 0). If you still encounter "failed to load location" errors, those locations
+likely don't have any nearby Street View coverage and GeoGuessr cannot find a suitable
+alternative. You may need to manually remove those locations from your CSV.
 """
 
 import csv
@@ -11,7 +25,17 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from collections import defaultdict
 from datetime import datetime
+import math
+import os
+import urllib.request
+import urllib.error
+import urllib.parse
 import osxphotos
+from tqdm import tqdm
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 class LocationExtractor:
@@ -58,40 +82,182 @@ class LocationExtractor:
         # If no exif_info attribute or it's None, likely a screenshot
         return False
     
-    def deduplicate_locations(self, locations: List[Dict], precision: int = 6) -> List[Dict]:
+    def _haversine_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """
-        Remove duplicate locations based on rounded coordinates.
+        Calculate the great circle distance between two points on Earth in meters.
+        
+        Args:
+            lat1, lon1: Latitude and longitude of first point
+            lat2, lon2: Latitude and longitude of second point
+            
+        Returns:
+            Distance in meters
+        """
+        # Earth radius in meters
+        R = 6371000
+        
+        # Convert to radians
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        
+        # Haversine formula
+        a = math.sin(delta_phi / 2) ** 2 + \
+            math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        
+        return R * c
+    
+    def deduplicate_locations(self, locations: List[Dict], distance_meters: float = 200.0) -> List[Dict]:
+        """
+        Remove duplicate locations using distance-based deduplication (Haversine formula).
         
         Args:
             locations: List of location dictionaries
-            precision: Number of decimal places to round coordinates to (default: 6, ~0.1m precision)
+            distance_meters: Maximum distance in meters to consider locations as duplicates (default: 200m)
             
         Returns:
-            Deduplicated list of location dictionaries
+            Deduplicated list of location dictionaries (keeps the first occurrence of each duplicate)
         """
-        seen = set()
         deduplicated = []
         
-        for loc in locations:
+        # Use tqdm for progress bar
+        for loc in tqdm(locations, desc="Deduplicating locations", unit="location"):
             lat = loc.get('latitude')
             lon = loc.get('longitude')
             
             if lat is None or lon is None:
                 continue
             
-            # Round coordinates to specified precision
-            rounded_lat = round(lat, precision)
-            rounded_lon = round(lon, precision)
+            # Check if this location is within distance_meters of any already added location
+            is_duplicate = False
+            for existing_loc in deduplicated:
+                existing_lat = existing_loc.get('latitude')
+                existing_lon = existing_loc.get('longitude')
+                
+                if existing_lat is None or existing_lon is None:
+                    continue
+                
+                distance = self._haversine_distance(lat, lon, existing_lat, existing_lon)
+                if distance <= distance_meters:
+                    is_duplicate = True
+                    break
             
-            # Create a key for this location
-            location_key = (rounded_lat, rounded_lon)
-            
-            # Only add if we haven't seen this location before
-            if location_key not in seen:
-                seen.add(location_key)
+            if not is_duplicate:
                 deduplicated.append(loc)
         
         return deduplicated
+    
+    def _check_street_view_pano(self, lat: float, lon: float, api_key: str, radius: int = 50) -> Optional[Dict]:
+        """
+        Check if a Street View panorama exists near the given coordinates.
+        Uses Google Street View Metadata API.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            api_key: Google Maps API key
+            radius: Search radius in meters (default: 50m)
+            
+        Returns:
+            Dictionary with pano info if found, None otherwise.
+            Format: {'pano_lat': float, 'pano_lon': float, 'pano_id': str, 'distance_m': float}
+        """
+        base_url = "https://maps.googleapis.com/maps/api/streetview/metadata"
+        
+        params = {
+            'location': f"{lat},{lon}",
+            'radius': radius,
+            'key': api_key
+        }
+        
+        try:
+            url = f"{base_url}?{urllib.parse.urlencode(params)}"
+            request = urllib.request.Request(url)
+            
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                status = data.get('status', 'UNKNOWN_ERROR')
+                
+                if status == 'OK':
+                    pano_location = data.get('location', {})
+                    pano_lat = pano_location.get('lat')
+                    pano_lon = pano_location.get('lng')
+                    pano_id = data.get('pano_id', '')
+                    
+                    if pano_lat is not None and pano_lon is not None:
+                        # Calculate distance between photo location and panorama location
+                        distance_m = self._haversine_distance(lat, lon, pano_lat, pano_lon)
+                        
+                        return {
+                            'pano_lat': pano_lat,
+                            'pano_lon': pano_lon,
+                            'pano_id': pano_id,
+                            'distance_m': distance_m
+                        }
+                
+                # No panorama found
+                return None
+                
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, KeyError) as e:
+            # If API call fails, return None (fail closed - don't include location)
+            return None
+    
+    def filter_street_view_panos(self, locations: List[Dict], api_key: str, max_distance_m: float = 40.0) -> Tuple[List[Dict], int]:
+        """
+        Filter locations to only include those with Street View panoramas within acceptable distance.
+        
+        Args:
+            locations: List of location dictionaries
+            api_key: Google Maps API key
+            max_distance_m: Maximum distance in meters between photo and panorama (default: 40m)
+                          Locations with distance > max_distance_m will be filtered out
+            
+        Returns:
+            Tuple of (filtered_locations, filtered_count)
+            Filtered locations will have pano_lat, pano_lon, pano_distance_m, and pano_id added to their dict
+        """
+        filtered = []
+        filtered_count = 0
+        
+        print(f"Checking Street View panorama coverage (max distance: {max_distance_m}m)...")
+        total = len(locations)
+        
+        # Use tqdm for progress bar
+        for loc in tqdm(locations, total=total, desc="Checking panoramas", unit="location"):
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            
+            if lat is None or lon is None:
+                filtered_count += 1
+                continue
+            
+            # Check for Street View panorama
+            pano_info = self._check_street_view_pano(lat, lon, api_key, radius=50)
+            
+            if pano_info is None:
+                # No panorama found
+                filtered_count += 1
+                continue
+            
+            distance_m = pano_info['distance_m']
+            
+            if distance_m > max_distance_m:
+                # Panorama too far away
+                filtered_count += 1
+                continue
+            
+            # Add panorama info to location dict
+            loc_with_pano = loc.copy()
+            loc_with_pano['pano_lat'] = pano_info['pano_lat']
+            loc_with_pano['pano_lon'] = pano_info['pano_lon']
+            loc_with_pano['pano_distance_m'] = distance_m
+            loc_with_pano['pano_id'] = pano_info.get('pano_id', '')
+            
+            filtered.append(loc_with_pano)
+        
+        return filtered, filtered_count
     
     def extract_locations(self, start_date: Optional[str] = None, end_date: Optional[str] = None) -> List[Dict]:
         """
@@ -152,9 +318,8 @@ class LocationExtractor:
         all_photos = self.photosdb.photos()
         total_photos = len(all_photos)
         
-        for idx, photo in enumerate(all_photos, 1):
-            if idx % 1000 == 0:
-                print(f"  Processed {idx}/{total_photos} photos...")
+        # Use tqdm for progress bar
+        for photo in tqdm(all_photos, total=total_photos, desc="Processing photos", unit="photo"):
             
             # Check if photo has location data
             if photo.location:
@@ -162,6 +327,13 @@ class LocationExtractor:
                 
                 # Skip if coordinates are null/None
                 if lat is None or lon is None:
+                    null_coord_count += 1
+                    continue
+                
+                # Validate coordinate ranges
+                # Latitude must be between -90 and 90
+                # Longitude must be between -180 and 180
+                if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
                     null_coord_count += 1
                     continue
                 
@@ -242,22 +414,37 @@ class LocationExtractor:
         """
         output_file = Path(output_path)
         
-        # Filter out any null coordinates as a safety check
-        valid_locations = [
-            loc for loc in locations 
-            if loc.get('latitude') is not None 
-            and loc.get('longitude') is not None
-        ]
+        # Filter out any null or invalid coordinates as a safety check
+        valid_locations = []
+        for loc in locations:
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            
+            if lat is None or lon is None:
+                continue
+            
+            # Validate coordinate ranges
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                continue
+            
+            # Skip (0, 0) coordinates as they're often invalid
+            if lat == 0.0 and lon == 0.0:
+                continue
+            
+            valid_locations.append(loc)
         
         with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
             writer = csv.writer(csvfile)
             writer.writerow(['Latitude', 'Longitude'])
             for loc in valid_locations:
-                writer.writerow([loc['latitude'], loc['longitude']])
+                # Use panorama coordinates if available (for GeoGuessr), otherwise use photo coordinates
+                lat = loc.get('pano_lat', loc.get('latitude'))
+                lon = loc.get('pano_lon', loc.get('longitude'))
+                writer.writerow([lat, lon])
         
         filtered_count = len(locations) - len(valid_locations)
         if filtered_count > 0:
-            print(f"Filtered out {filtered_count} entries with null coordinates from CSV")
+            print(f"Filtered out {filtered_count} entries with invalid coordinates from CSV")
         print(f"CSV file saved to: {output_file.absolute()}")
     
     def export_to_geojson(self, locations: List[Dict], output_path: str = 'photo_locations.geojson'):
@@ -281,16 +468,28 @@ class LocationExtractor:
             print(f"GeoJSON file saved to: {output_file.absolute()}")
             return
         
-        # Filter out any null coordinates as a safety check
-        valid_locations = [
-            loc for loc in locations 
-            if loc.get('latitude') is not None 
-            and loc.get('longitude') is not None
-        ]
+        # Filter out any null or invalid coordinates as a safety check
+        valid_locations = []
+        for loc in locations:
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            
+            if lat is None or lon is None:
+                continue
+            
+            # Validate coordinate ranges
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                continue
+            
+            # Skip (0, 0) coordinates as they're often invalid
+            if lat == 0.0 and lon == 0.0:
+                continue
+            
+            valid_locations.append(loc)
         
         filtered_count = len(locations) - len(valid_locations)
         if filtered_count > 0:
-            print(f"Filtered out {filtered_count} entries with null coordinates from GeoJSON")
+            print(f"Filtered out {filtered_count} entries with invalid coordinates from GeoJSON")
         
         # Group coordinates by region
         print("Grouping coordinates by region...")
@@ -298,7 +497,10 @@ class LocationExtractor:
         
         for loc in valid_locations:
             region = loc.get('region', 'Unknown')
-            region_coords[region].append([loc['longitude'], loc['latitude']])
+            # Use panorama coordinates if available (for GeoGuessr), otherwise use photo coordinates
+            lon = loc.get('pano_lon', loc.get('longitude'))
+            lat = loc.get('pano_lat', loc.get('latitude'))
+            region_coords[region].append([lon, lat])
         
         print(f"Found {len(region_coords)} regions")
         
@@ -347,12 +549,25 @@ class LocationExtractor:
                 'null_coordinates': 0,
             }
         
-        # Filter out null coordinates for valid stats
-        valid_locations = [
-            loc for loc in locations 
-            if loc.get('latitude') is not None 
-            and loc.get('longitude') is not None
-        ]
+        # Filter out null or invalid coordinates for valid stats
+        valid_locations = []
+        for loc in locations:
+            lat = loc.get('latitude')
+            lon = loc.get('longitude')
+            
+            if lat is None or lon is None:
+                continue
+            
+            # Validate coordinate ranges
+            if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                continue
+            
+            # Skip (0, 0) coordinates as they're often invalid
+            if lat == 0.0 and lon == 0.0:
+                continue
+            
+            valid_locations.append(loc)
+        
         null_coord_count = len(locations) - len(valid_locations)
         
         stats = {
@@ -415,13 +630,24 @@ def main():
     parser.add_argument(
         '--dedupe',
         action='store_true',
-        help='Remove duplicate locations (same coordinates rounded to 6 decimal places, ~0.1m precision)'
+        help='Remove duplicate locations within 200 meters of each other (default distance)'
     )
     parser.add_argument(
-        '--dedupe-precision',
-        type=int,
-        default=6,
-        help='Precision for deduplication (decimal places). Default: 6 (~0.1m). Lower = more aggressive deduplication.'
+        '--dedupe-distance',
+        type=float,
+        default=500.0,
+        help='Override default deduplication distance. Remove locations within this many meters of each other (default: 200m when --dedupe is used)'
+    )
+    parser.add_argument(
+        '--filter-panos',
+        action='store_true',
+        help='Filter locations to only include those with Street View panoramas within acceptable distance (requires MAP_API_KEY in .env file)'
+    )
+    parser.add_argument(
+        '--pano-max-distance',
+        type=float,
+        default=40.0,
+        help='Maximum distance in meters between photo location and Street View panorama (default: 40m). Locations with distance > this will be filtered out.'
     )
     
     args = parser.parse_args()
@@ -439,11 +665,32 @@ def main():
     # Deduplicate if requested
     original_count = len(locations)
     dedupe_count = 0
+    pano_filtered_count = 0
+    
     if args.dedupe:
-        locations = extractor.deduplicate_locations(locations, precision=args.dedupe_precision)
+        # Use custom distance if provided, otherwise default to 200m
+        distance = args.dedupe_distance
+        locations = extractor.deduplicate_locations(locations, distance_meters=distance)
         dedupe_count = original_count - len(locations)
         if dedupe_count > 0:
-            print(f"\nDeduplicated: removed {dedupe_count} duplicate locations ({len(locations)} unique locations remaining)")
+            print(f"\nDeduplicated ({distance}m): removed {dedupe_count} duplicate locations ({len(locations)} unique locations remaining)")
+    
+    # Filter Street View panoramas if requested
+    if args.filter_panos:
+        api_key = os.environ.get('MAP_API_KEY')
+        if not api_key:
+            print("\n⚠️  Warning: --filter-panos requires MAP_API_KEY in .env file or environment variable. Skipping panorama filtering.")
+        else:
+            locations, pano_filtered_count = extractor.filter_street_view_panos(
+                locations,
+                api_key=api_key,
+                max_distance_m=args.pano_max_distance
+            )
+            if pano_filtered_count > 0:
+                print(f"\nFiltered out {pano_filtered_count} locations without Street View panoramas or with panoramas too far away")
+                print(f"({len(locations)} locations with valid panoramas remaining)")
+            else:
+                print(f"\nAll {len(locations)} locations have valid Street View panoramas")
     
     # Show statistics
     stats = extractor.get_statistics(locations)
@@ -459,6 +706,8 @@ def main():
         print(f"  - Null coordinates filtered: {stats['null_coordinates']}")
     if dedupe_count > 0:
         print(f"  - Duplicates removed: {dedupe_count}")
+    if pano_filtered_count > 0:
+        print(f"  - No Street View panorama (or too far): {pano_filtered_count}")
     if 'date_range' in stats:
         print(f"\nDate range:")
         print(f"  - Earliest: {stats['date_range']['earliest']}")
